@@ -13,6 +13,12 @@ WORKER_COST = 2.0
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
+# Stress/benchmark tests (>6s each) that should only run when directly covered or their core engine file is edited
+STRESS_TEST_IDS = {
+    "tests/test_parser.py::TestParser::test_max_nodes",
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+}
+
 
 def normalize_code_lines(lines: list[str]) -> list[str]:
     """Strip blank lines and pure # comment lines to detect comment/whitespace-only diffs."""
@@ -131,6 +137,7 @@ def main() -> None:
     tests_raw = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     by_num = {t["number"]: t for t in tests_raw}
     all_nums = set(by_num.keys())
+    stress_nums = {t["number"] for t in tests_raw if t["id"] in STRESS_TEST_IDS}
 
     tests_by_file: dict[str, set[int]] = defaultdict(set)
     for t in tests_raw:
@@ -166,18 +173,17 @@ def main() -> None:
             s.update(tlist)
         file_all_tests[fpath] = s
 
-    fast_cross_dialect_suites: set[int] = set()
+    # Cross-dialect integration suites (all fast when stress tests are separated)
+    cross_dialect_suites: set[int] = set()
     for tf in [
+        "tests/dialects/test_dialect.py",
         "tests/test_transpile.py",
         "tests/test_optimizer.py",
         "tests/test_parser.py",
         "tests/test_expressions.py",
     ]:
-        fast_cross_dialect_suites.update(tests_by_file.get(tf, set()))
-
-    dialect_runner_suite: set[int] = set()
-    for tf in ["tests/dialects/test_dialect.py", "tests/test_transpile.py"]:
-        dialect_runner_suite.update(tests_by_file.get(tf, set()))
+        cross_dialect_suites.update(tests_by_file.get(tf, set()))
+    cross_dialect_suites -= stress_nums
 
     optimizer_suites: set[int] = set()
     for tf in [
@@ -187,6 +193,7 @@ def main() -> None:
         "tests/test_lineage.py",
     ]:
         optimizer_suites.update(tests_by_file.get(tf, set()))
+    optimizer_suites -= stress_nums
 
     for patch_path in sorted((DATA / "commits").glob("*.patch")):
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
@@ -199,14 +206,13 @@ def main() -> None:
             elif fpath in tests_by_file:
                 selected_nums.update(tests_by_file[fpath])
             elif fpath.startswith("tests/fixtures/optimizer/"):
-                selected_nums.update(tests_by_file.get("tests/test_optimizer.py", set()))
+                selected_nums.update(tests_by_file.get("tests/test_optimizer.py", set()) - stress_nums)
             elif fpath.startswith("tests/fixtures/"):
-                selected_nums.update(dialect_runner_suite)
-                selected_nums.update(fast_cross_dialect_suites)
+                selected_nums.update(cross_dialect_suites)
                 stem_tokens = set(re.split(r"[^a-z0-9]+", fpath.lower())) - {"tests", "fixtures", "sql", "json", ""}
                 for tfile, tnums in tests_by_file.items():
                     if any(tok in tfile.lower() for tok in stem_tokens if len(tok) >= 3):
-                        selected_nums.update(tnums)
+                        selected_nums.update(tnums - stress_nums)
             elif fpath in cov_map:
                 f_tests = file_all_tests.get(fpath, set())
                 stem = Path(fpath).stem
@@ -217,16 +223,20 @@ def main() -> None:
                 )
                 if is_dialect_family:
                     selected_nums.update(f_tests)
-                    selected_nums.update(set(dialect_map[stem]) - tests_by_file.get("tests/dialects/test_dialect.py", set()))
-                    selected_nums.update(fast_cross_dialect_suites)
-                    selected_nums.update(direct_importers.get(mod, set()))
+                    selected_nums.update(set(dialect_map[stem]) - stress_nums)
+                    selected_nums.update(cross_dialect_suites)
+                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 elif fpath.startswith("sqlglot/optimizer/"):
                     selected_nums.update(f_tests)
                     selected_nums.update(optimizer_suites)
+                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
+                elif fpath.startswith("sqlglot/executor/"):
+                    selected_nums.update(f_tests)
+                    selected_nums.update(tests_by_file.get("tests/test_executor.py", set()))
                     selected_nums.update(direct_importers.get(mod, set()))
                 elif len(f_tests) <= 350:
                     selected_nums.update(f_tests)
-                    selected_nums.update(direct_importers.get(mod, set()))
+                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 else:
                     line_dict = cov_map[fpath]
                     spans = func_ranges.get(fpath, [])

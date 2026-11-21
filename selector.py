@@ -21,6 +21,9 @@ STRESS_TEST_IDS = {
 
 HEAVY_OPTIMIZER_ONLY_IDS = {
     "tests/test_optimizer.py::TestOptimizer::test_scope",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
     "tests/test_optimizer.py::TestOptimizer::test_tpcds",
     "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
     "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries",
@@ -345,7 +348,7 @@ def main() -> None:
                     )
                     selected_nums.update((func_hits - unrelated_dialect_tests) - stress_nums)
                     if stem in per_dialect_suite:
-                        selected_nums.update(set(per_dialect_suite[stem]) - stress_nums)
+                        selected_nums.update((set(per_dialect_suite[stem]) - unrelated_dialect_tests) - stress_nums)
                     else:
                         selected_nums.update((set(dialect_map[stem]) - unrelated_dialect_tests) - stress_nums)
                     for sub_d in allowed_family:

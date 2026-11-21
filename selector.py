@@ -173,7 +173,9 @@ def main() -> None:
         dialect_map: dict[str, list[int]] = json.load(f)
 
     with gzip.open(FIXTURE_PATH, "rt", encoding="utf-8") as f:
-        fixture_map: dict[str, list[int]] = json.load(f)
+        fix_payload = json.load(f)
+    fixture_map: dict[str, list[int]] = fix_payload["fixtures"]
+    dialect_aware_opt: set[int] = set(fix_payload["dialect_aware_opt"])
 
     # Build 1-hop and 2-hop module -> dependent test mapping
     mod_to_file: dict[str, str] = {}
@@ -199,7 +201,7 @@ def main() -> None:
             s.update(tlist)
         file_all_tests[fpath] = s
 
-    # Cross-dialect integration suites (excluding stress and heavy optimizer-only benchmarks)
+    # Cross-dialect integration suites (full test_optimizer.py catches multi-dialect SQL fixtures)
     cross_dialect_suites: set[int] = set()
     for tf in [
         "tests/dialects/test_dialect.py",

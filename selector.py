@@ -14,13 +14,11 @@ WORKER_COST = 2.0
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
-# Stress/benchmark tests (>6s each) that run only when directly covered or their core engine file is edited
 STRESS_TEST_IDS = {
     "tests/test_parser.py::TestParser::test_max_nodes",
     "tests/test_generator.py::TestGenerator::test_generator_memory",
 }
 
-# Heavy optimizer-only benchmark tests (>0.9s each) not needed for routine per-dialect sweeps
 HEAVY_OPTIMIZER_ONLY_IDS = {
     "tests/test_optimizer.py::TestOptimizer::test_scope",
     "tests/test_optimizer.py::TestOptimizer::test_tpcds",
@@ -32,7 +30,6 @@ HEAVY_OPTIMIZER_ONLY_IDS = {
 
 
 def normalize_code_lines(lines: list[str]) -> list[str]:
-    """Strip blank lines and pure # comment lines to detect comment/whitespace-only diffs."""
     out: list[str] = []
     for raw in lines:
         s = raw.strip()
@@ -46,7 +43,6 @@ def normalize_code_lines(lines: list[str]) -> list[str]:
 
 
 def parse_patch(patch_text: str) -> dict[str, set[int]]:
-    """Return {file_path: set_of_changed_line_numbers} for files with substantive changes."""
     file_lines: dict[str, set[int]] = defaultdict(set)
     added_raw: dict[str, list[str]] = defaultdict(list)
     removed_raw: dict[str, list[str]] = defaultdict(list)
@@ -103,14 +99,53 @@ def parse_patch(patch_text: str) -> dict[str, set[int]]:
 
 
 def split_lpt(tests: list[dict], worker_count: int) -> tuple[float, list[list[int]]]:
-    workers: list[list[int]] = [[] for _ in range(worker_count)]
+    workers: list[list[dict]] = [[] for _ in range(worker_count)]
     loads = [0.0] * worker_count
     for test in sorted(tests, key=lambda t: t["seconds"], reverse=True):
         lightest = loads.index(min(loads))
-        workers[lightest].append(test["number"])
+        workers[lightest].append(test)
         loads[lightest] += test["seconds"]
+
+    # Local-search refinement: move or swap items off the heaviest worker
+    if worker_count > 1:
+        improved = True
+        while improved:
+            improved = False
+            heavy_idx = loads.index(max(loads))
+            heavy_load = loads[heavy_idx]
+            for other_idx in range(worker_count):
+                if other_idx == heavy_idx:
+                    continue
+                other_load = loads[other_idx]
+                for i, t_a in enumerate(workers[heavy_idx]):
+                    sec_a = t_a["seconds"]
+                    # Try single move
+                    if max(heavy_load - sec_a, other_load + sec_a) < heavy_load - 1e-6:
+                        workers[heavy_idx].pop(i)
+                        workers[other_idx].append(t_a)
+                        loads[heavy_idx] -= sec_a
+                        loads[other_idx] += sec_a
+                        improved = True
+                        break
+                    # Try 1-for-1 swap
+                    for j, t_b in enumerate(workers[other_idx]):
+                        sec_b = t_b["seconds"]
+                        new_heavy = heavy_load - sec_a + sec_b
+                        new_other = other_load - sec_b + sec_a
+                        if max(new_heavy, new_other) < heavy_load - 1e-6:
+                            workers[heavy_idx][i] = t_b
+                            workers[other_idx][j] = t_a
+                            loads[heavy_idx] = new_heavy
+                            loads[other_idx] = new_other
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+
     total_cost = max(loads) + WORKER_COST * worker_count
-    return total_cost, workers
+    return total_cost, [[t["number"] for t in w] for w in workers]
 
 
 def choose_best_workers(selected_tests: list[dict]) -> list[list[int]]:
@@ -142,6 +177,41 @@ def module_name_for_path(fpath: str) -> str:
     if fpath.endswith(".py"):
         return fpath[:-3].replace("/", ".")
     return fpath
+
+
+def lookup_function_level(
+    fpath: str,
+    lines: set[int],
+    cov_map: dict[str, dict[str, list[int]]],
+    func_ranges: dict[str, list[list[int]]],
+    file_all_tests: dict[str, set[int]],
+    direct_importers: dict[str, set[int]],
+    mod: str,
+) -> set[int]:
+    line_dict = cov_map[fpath]
+    spans = func_ranges.get(fpath, [])
+    expanded_lines: set[int] = set()
+    module_level_touched = False
+
+    for ln in lines:
+        enclosing = [(s, e) for (s, e) in spans if (s - 2) <= ln <= (e + 2)]
+        if enclosing:
+            min_len = min(e - s for (s, e) in enclosing)
+            for (s, e) in enclosing:
+                if (e - s) <= min_len + 5:
+                    expanded_lines.update(range(s, e + 1))
+        else:
+            module_level_touched = True
+
+    if module_level_touched:
+        return file_all_tests.get(fpath, set()) | direct_importers.get(mod, set())
+
+    matched: set[int] = set()
+    for eln in expanded_lines:
+        tlist = line_dict.get(str(eln))
+        if tlist:
+            matched.update(tlist)
+    return matched if matched else file_all_tests.get(fpath, set())
 
 
 def main() -> None:
@@ -176,8 +246,8 @@ def main() -> None:
         fix_payload = json.load(f)
     fixture_map: dict[str, list[int]] = fix_payload["fixtures"]
     dialect_aware_opt: set[int] = set(fix_payload["dialect_aware_opt"])
+    per_dialect_opt: dict[str, list[int]] = fix_payload.get("per_dialect_opt", {})
 
-    # Build 1-hop and 2-hop module -> dependent test mapping
     mod_to_file: dict[str, str] = {}
     for src_file in imports_map:
         mod_to_file[module_name_for_path(src_file)] = src_file
@@ -188,7 +258,6 @@ def main() -> None:
             tnums = tests_by_file[src_file]
             for mod in imported_mods:
                 direct_importers[mod].update(tnums)
-                # 2-hop: if test imports mod, and mod imports sub_mod
                 mid_file = mod_to_file.get(mod)
                 if mid_file:
                     for sub_mod in imports_map.get(mid_file, []):
@@ -201,12 +270,10 @@ def main() -> None:
             s.update(tlist)
         file_all_tests[fpath] = s
 
-    # Cross-dialect integration suites (full test_optimizer.py catches multi-dialect SQL fixtures)
-    cross_dialect_suites: set[int] = set()
+    cross_dialect_suites: set[int] = set(dialect_aware_opt)
     for tf in [
         "tests/dialects/test_dialect.py",
         "tests/test_transpile.py",
-        "tests/test_optimizer.py",
     ]:
         cross_dialect_suites.update(tests_by_file.get(tf, set()))
     cross_dialect_suites -= (stress_nums | heavy_opt_only_nums)
@@ -252,49 +319,29 @@ def main() -> None:
                 if is_dialect_family:
                     selected_nums.update(f_tests)
                     selected_nums.update(set(dialect_map[stem]) - stress_nums)
-                    selected_nums.update(cross_dialect_suites)
+                    selected_nums.update(
+                        (tests_by_file.get("tests/dialects/test_dialect.py", set())
+                         | tests_by_file.get("tests/test_transpile.py", set())
+                         | set(per_dialect_opt.get(stem, dialect_aware_opt)))
+                        - (stress_nums | heavy_opt_only_nums)
+                    )
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 elif fpath.startswith("sqlglot/optimizer/"):
                     selected_nums.update(f_tests)
                     selected_nums.update(optimizer_suites)
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 elif fpath.startswith("sqlglot/executor/"):
-                    selected_nums.update(f_tests)
+                    selected_nums.update(
+                        lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod)
+                    )
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 elif len(f_tests) <= 350:
                     selected_nums.update(f_tests)
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 else:
-                    line_dict = cov_map[fpath]
-                    spans = func_ranges.get(fpath, [])
-                    expanded_lines: set[int] = set()
-                    module_level_touched = False
-
-                    for ln in lines:
-                        enclosing = [
-                            (s, e) for (s, e) in spans
-                            if (s - 2) <= ln <= (e + 2)
-                        ]
-                        if enclosing:
-                            min_len = min(e - s for (s, e) in enclosing)
-                            for (s, e) in enclosing:
-                                if (e - s) <= min_len + 5:
-                                    expanded_lines.update(range(s, e + 1))
-                        else:
-                            module_level_touched = True
-
-                    if module_level_touched:
-                        selected_nums.update(f_tests)
-                        selected_nums.update(direct_importers.get(mod, set()))
-                    else:
-                        matched_any = False
-                        for eln in expanded_lines:
-                            tlist = line_dict.get(str(eln))
-                            if tlist:
-                                selected_nums.update(tlist)
-                                matched_any = True
-                        if not matched_any:
-                            selected_nums.update(f_tests)
+                    selected_nums.update(
+                        lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod)
+                    )
             else:
                 selected_nums.update(all_nums)
 

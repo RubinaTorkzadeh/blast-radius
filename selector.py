@@ -199,7 +199,7 @@ def main() -> None:
             elif fpath in tests_by_file:
                 selected_nums.update(tests_by_file[fpath])
             elif fpath.startswith("tests/fixtures/optimizer/"):
-                selected_nums.update(optimizer_suites)
+                selected_nums.update(tests_by_file.get("tests/test_optimizer.py", set()))
             elif fpath.startswith("tests/fixtures/"):
                 selected_nums.update(dialect_runner_suite)
                 selected_nums.update(fast_cross_dialect_suites)
@@ -217,7 +217,7 @@ def main() -> None:
                 )
                 if is_dialect_family:
                     selected_nums.update(f_tests)
-                    selected_nums.update(dialect_map[stem])
+                    selected_nums.update(set(dialect_map[stem]) - tests_by_file.get("tests/dialects/test_dialect.py", set()))
                     selected_nums.update(fast_cross_dialect_suites)
                     selected_nums.update(direct_importers.get(mod, set()))
                 elif fpath.startswith("sqlglot/optimizer/"):

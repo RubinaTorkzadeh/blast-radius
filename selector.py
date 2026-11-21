@@ -247,6 +247,7 @@ def main() -> None:
     fixture_map: dict[str, list[int]] = fix_payload["fixtures"]
     dialect_aware_opt: set[int] = set(fix_payload["dialect_aware_opt"])
     per_dialect_opt: dict[str, list[int]] = fix_payload.get("per_dialect_opt", {})
+    per_dialect_suite: dict[str, list[int]] = fix_payload.get("per_dialect_suite", {})
 
     mod_to_file: dict[str, str] = {}
     for src_file in imports_map:
@@ -317,12 +318,16 @@ def main() -> None:
                     and stem in dialect_map
                 )
                 if is_dialect_family:
-                    selected_nums.update(f_tests)
-                    selected_nums.update(set(dialect_map[stem]) - stress_nums)
+                    func_hits = lookup_function_level(
+                        fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod
+                    )
+                    selected_nums.update(func_hits - stress_nums)
+                    if stem in per_dialect_suite:
+                        selected_nums.update(set(per_dialect_suite[stem]) - stress_nums)
+                    else:
+                        selected_nums.update(set(dialect_map[stem]) - stress_nums)
                     selected_nums.update(
-                        (tests_by_file.get("tests/dialects/test_dialect.py", set())
-                         | tests_by_file.get("tests/test_transpile.py", set())
-                         | set(per_dialect_opt.get(stem, dialect_aware_opt)))
+                        set(per_dialect_opt.get(stem, dialect_aware_opt))
                         - (stress_nums | heavy_opt_only_nums)
                     )
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)

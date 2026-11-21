@@ -29,6 +29,7 @@ def main() -> None:
     test_method_strings: dict[int, set[str]] = defaultdict(set)
     dialect_aware_opt_tests: set[int] = set()
     per_dialect_opt_tests: dict[str, set[int]] = defaultdict(set)
+    per_dialect_suite_tests: dict[str, set[int]] = defaultdict(set)
 
     known_dialects = {
         p.stem for p in (REPO / "sqlglot" / "dialects").glob("*.py")
@@ -56,8 +57,12 @@ def main() -> None:
                         low = sub.value.lower()
                         if low in known_dialects:
                             mentioned_dialects.add(low)
+                        else:
+                            for m in dialect_token_re.finditer(low):
+                                mentioned_dialects.add(m.group(1).lower())
                     elif isinstance(sub, ast.keyword) and sub.arg in {"dialect", "read", "write"}:
                         uses_generic_dialect = True
+
                 if tfile == "tests/test_optimizer.py":
                     if mentioned_dialects:
                         dialect_aware_opt_tests.add(tnum)
@@ -67,6 +72,17 @@ def main() -> None:
                         dialect_aware_opt_tests.add(tnum)
                         for d in known_dialects:
                             per_dialect_opt_tests[d].add(tnum)
+                elif tfile.startswith("tests/dialects/"):
+                    stem_name = Path(tfile).stem
+                    if stem_name.startswith("test_") and stem_name[5:] in known_dialects:
+                        per_dialect_suite_tests[stem_name[5:]].add(tnum)
+                    if mentioned_dialects:
+                        for d in mentioned_dialects:
+                            per_dialect_suite_tests[d].add(tnum)
+                    elif tfile == "tests/dialects/test_dialect.py":
+                        # Generic base-dialect test in test_dialect.py: include for all dialects
+                        for d in known_dialects:
+                            per_dialect_suite_tests[d].add(tnum)
 
     opt_nums = {t["number"] for t in tests_by_file.get("tests/test_optimizer.py", [])}
 
@@ -101,13 +117,14 @@ def main() -> None:
         "fixtures": {k: sorted(v) for k, v in fixture_to_tests.items() if v},
         "dialect_aware_opt": sorted(dialect_aware_opt_tests),
         "per_dialect_opt": {k: sorted(v) for k, v in per_dialect_opt_tests.items() if v},
+        "per_dialect_suite": {k: sorted(v) for k, v in per_dialect_suite_tests.items() if v},
     }
     with gzip.open("fixture_map.json.gz", "wt", encoding="utf-8") as f:
         json.dump(payload, f, separators=(",", ":"))
     print(
         f"Mapped {len(payload['fixtures'])} fixtures, "
         f"{len(dialect_aware_opt_tests)} dialect-aware opt tests, "
-        f"{len(payload['per_dialect_opt'])} dialects in per_dialect_opt"
+        f"{len(payload['per_dialect_suite'])} dialects in per_dialect_suite"
     )
 
 

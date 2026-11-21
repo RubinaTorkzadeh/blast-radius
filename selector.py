@@ -8,15 +8,26 @@ DATA = Path("/data")
 COV_PATH = Path("/app/coverage_map.json.gz")
 AST_PATH = Path("/app/ast_map.json.gz")
 DIALECT_PATH = Path("/app/dialect_map.json.gz")
+FIXTURE_PATH = Path("/app/fixture_map.json.gz")
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
-# Stress/benchmark tests (>6s each) that should only run when directly covered or their core engine file is edited
+# Stress/benchmark tests (>6s each) that run only when directly covered or their core engine file is edited
 STRESS_TEST_IDS = {
     "tests/test_parser.py::TestParser::test_max_nodes",
     "tests/test_generator.py::TestGenerator::test_generator_memory",
+}
+
+# Heavy optimizer-only benchmark tests (>0.9s each) not needed for routine per-dialect sweeps
+HEAVY_OPTIMIZER_ONLY_IDS = {
+    "tests/test_optimizer.py::TestOptimizer::test_scope",
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
+    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries",
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain",
 }
 
 
@@ -138,6 +149,7 @@ def main() -> None:
     by_num = {t["number"]: t for t in tests_raw}
     all_nums = set(by_num.keys())
     stress_nums = {t["number"] for t in tests_raw if t["id"] in STRESS_TEST_IDS}
+    heavy_opt_only_nums = {t["number"] for t in tests_raw if t["id"] in HEAVY_OPTIMIZER_ONLY_IDS}
 
     tests_by_file: dict[str, set[int]] = defaultdict(set)
     for t in tests_raw:
@@ -160,11 +172,25 @@ def main() -> None:
     with gzip.open(DIALECT_PATH, "rt", encoding="utf-8") as f:
         dialect_map: dict[str, list[int]] = json.load(f)
 
+    with gzip.open(FIXTURE_PATH, "rt", encoding="utf-8") as f:
+        fixture_map: dict[str, list[int]] = json.load(f)
+
+    # Build 1-hop and 2-hop module -> dependent test mapping
+    mod_to_file: dict[str, str] = {}
+    for src_file in imports_map:
+        mod_to_file[module_name_for_path(src_file)] = src_file
+
     direct_importers: dict[str, set[int]] = defaultdict(set)
     for src_file, imported_mods in imports_map.items():
         if src_file in tests_by_file:
+            tnums = tests_by_file[src_file]
             for mod in imported_mods:
-                direct_importers[mod].update(tests_by_file[src_file])
+                direct_importers[mod].update(tnums)
+                # 2-hop: if test imports mod, and mod imports sub_mod
+                mid_file = mod_to_file.get(mod)
+                if mid_file:
+                    for sub_mod in imports_map.get(mid_file, []):
+                        direct_importers[sub_mod].update(tnums)
 
     file_all_tests: dict[str, set[int]] = {}
     for fpath, line_dict in cov_map.items():
@@ -173,17 +199,15 @@ def main() -> None:
             s.update(tlist)
         file_all_tests[fpath] = s
 
-    # Cross-dialect integration suites (all fast when stress tests are separated)
+    # Cross-dialect integration suites (excluding stress and heavy optimizer-only benchmarks)
     cross_dialect_suites: set[int] = set()
     for tf in [
         "tests/dialects/test_dialect.py",
         "tests/test_transpile.py",
         "tests/test_optimizer.py",
-        "tests/test_parser.py",
-        "tests/test_expressions.py",
     ]:
         cross_dialect_suites.update(tests_by_file.get(tf, set()))
-    cross_dialect_suites -= stress_nums
+    cross_dialect_suites -= (stress_nums | heavy_opt_only_nums)
 
     optimizer_suites: set[int] = set()
     for tf in [
@@ -205,6 +229,8 @@ def main() -> None:
                 continue
             elif fpath in tests_by_file:
                 selected_nums.update(tests_by_file[fpath])
+            elif fpath in fixture_map:
+                selected_nums.update(fixture_map[fpath])
             elif fpath.startswith("tests/fixtures/optimizer/"):
                 selected_nums.update(tests_by_file.get("tests/test_optimizer.py", set()) - stress_nums)
             elif fpath.startswith("tests/fixtures/"):
@@ -232,8 +258,7 @@ def main() -> None:
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 elif fpath.startswith("sqlglot/executor/"):
                     selected_nums.update(f_tests)
-                    selected_nums.update(tests_by_file.get("tests/test_executor.py", set()))
-                    selected_nums.update(direct_importers.get(mod, set()))
+                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
                 elif len(f_tests) <= 350:
                     selected_nums.update(f_tests)
                     selected_nums.update(direct_importers.get(mod, set()) - stress_nums)

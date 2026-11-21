@@ -187,6 +187,7 @@ def lookup_function_level(
     file_all_tests: dict[str, set[int]],
     direct_importers: dict[str, set[int]],
     mod: str,
+    allow_module_fallback: bool = True,
 ) -> set[int]:
     line_dict = cov_map[fpath]
     spans = func_ranges.get(fpath, [])
@@ -203,7 +204,7 @@ def lookup_function_level(
         else:
             module_level_touched = True
 
-    if module_level_touched:
+    if module_level_touched and allow_module_fallback:
         has_exec_module_line = any(
             str(ln) in line_dict and not any((s - 2) <= ln <= (e + 2) for (s, e) in spans)
             for ln in lines
@@ -333,7 +334,14 @@ def main() -> None:
                                 unrelated_dialect_tests.update(tnums)
 
                     func_hits = lookup_function_level(
-                        fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod
+                        fpath,
+                        lines,
+                        cov_map,
+                        func_ranges,
+                        file_all_tests,
+                        direct_importers,
+                        mod,
+                        allow_module_fallback=False,
                     )
                     selected_nums.update((func_hits - unrelated_dialect_tests) - stress_nums)
                     if stem in per_dialect_suite:

@@ -204,7 +204,12 @@ def lookup_function_level(
             module_level_touched = True
 
     if module_level_touched:
-        return file_all_tests.get(fpath, set()) | direct_importers.get(mod, set())
+        has_exec_module_line = any(
+            str(ln) in line_dict and not any((s - 2) <= ln <= (e + 2) for (s, e) in spans)
+            for ln in lines
+        )
+        if has_exec_module_line:
+            return file_all_tests.get(fpath, set()) | direct_importers.get(mod, set())
 
     matched: set[int] = set()
     for eln in expanded_lines:
@@ -248,6 +253,7 @@ def main() -> None:
     dialect_aware_opt: set[int] = set(fix_payload["dialect_aware_opt"])
     per_dialect_opt: dict[str, list[int]] = fix_payload.get("per_dialect_opt", {})
     per_dialect_suite: dict[str, list[int]] = fix_payload.get("per_dialect_suite", {})
+    dialect_descendants: dict[str, list[str]] = fix_payload.get("dialect_descendants", {})
 
     mod_to_file: dict[str, str] = {}
     for src_file in imports_map:
@@ -318,19 +324,28 @@ def main() -> None:
                     and stem in dialect_map
                 )
                 if is_dialect_family:
+                    allowed_family = set(dialect_descendants.get(stem, [stem]))
+                    unrelated_dialect_tests: set[int] = set()
+                    for tf, tnums in tests_by_file.items():
+                        if tf.startswith("tests/dialects/test_") and tf != "tests/dialects/test_dialect.py":
+                            t_stem = Path(tf).stem[5:]
+                            if t_stem not in allowed_family:
+                                unrelated_dialect_tests.update(tnums)
+
                     func_hits = lookup_function_level(
                         fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod
                     )
-                    selected_nums.update(func_hits - stress_nums)
+                    selected_nums.update((func_hits - unrelated_dialect_tests) - stress_nums)
                     if stem in per_dialect_suite:
                         selected_nums.update(set(per_dialect_suite[stem]) - stress_nums)
                     else:
-                        selected_nums.update(set(dialect_map[stem]) - stress_nums)
-                    selected_nums.update(
-                        set(per_dialect_opt.get(stem, dialect_aware_opt))
-                        - (stress_nums | heavy_opt_only_nums)
-                    )
-                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
+                        selected_nums.update((set(dialect_map[stem]) - unrelated_dialect_tests) - stress_nums)
+                    for sub_d in allowed_family:
+                        selected_nums.update(
+                            set(per_dialect_opt.get(sub_d, dialect_aware_opt))
+                            - (stress_nums | heavy_opt_only_nums)
+                        )
+                    selected_nums.update((direct_importers.get(mod, set()) - unrelated_dialect_tests) - stress_nums)
                 elif fpath.startswith("sqlglot/optimizer/"):
                     selected_nums.update(f_tests)
                     selected_nums.update(optimizer_suites)

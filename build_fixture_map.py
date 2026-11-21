@@ -9,6 +9,56 @@ REPO = Path("/tmp/sqlglot_tmp")
 TESTS = json.loads(Path("sample/tests.json").read_text(encoding="utf-8"))["tests"]
 
 
+def compute_dialect_descendants(known_dialects: set[str]) -> dict[str, set[str]]:
+    # Map dialect stem -> direct parent dialect stems by parsing sqlglot/dialects/*.py
+    parents_of: dict[str, set[str]] = defaultdict(set)
+    for stem in known_dialects:
+        p = REPO / "sqlglot" / "dialects" / f"{stem}.py"
+        if not p.exists():
+            continue
+        tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+        imported_dialects: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                # e.g. from sqlglot.dialects.hive import Hive
+                parts = node.module.split(".")
+                if len(parts) >= 3 and parts[-2] == "dialects" and parts[-1] in known_dialects:
+                    for alias in node.names:
+                        imported_dialects[alias.asname or alias.name] = parts[-1]
+                elif node.module == "sqlglot.dialects":
+                    for alias in node.names:
+                        if alias.name in known_dialects:
+                            imported_dialects[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ClassDef):
+                for base in node.bases:
+                    base_name = None
+                    if isinstance(base, ast.Name):
+                        base_name = base.id
+                    elif isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
+                        if base.value.id in imported_dialects:
+                            parents_of[stem].add(imported_dialects[base.value.id])
+                    if base_name and base_name in imported_dialects:
+                        parents_of[stem].add(imported_dialects[base_name])
+
+    children_of: dict[str, set[str]] = defaultdict(set)
+    for child, pars in parents_of.items():
+        for par in pars:
+            children_of[par].add(child)
+
+    descendants: dict[str, set[str]] = {}
+    for d in known_dialects:
+        seen = {d}
+        stack = [d]
+        while stack:
+            cur = stack.pop()
+            for ch in children_of.get(cur, set()):
+                if ch not in seen:
+                    seen.add(ch)
+                    stack.append(ch)
+        descendants[d] = seen
+    return descendants
+
+
 def main() -> None:
     tests_by_file: dict[str, list[dict]] = defaultdict(list)
     test_by_stem: dict[str, list[int]] = defaultdict(list)
@@ -35,6 +85,8 @@ def main() -> None:
         p.stem for p in (REPO / "sqlglot" / "dialects").glob("*.py")
         if p.stem not in {"__init__", "dialect"}
     }
+    descendants = compute_dialect_descendants(known_dialects)
+
     dialect_token_re = re.compile(
         r"\b(" + "|".join(sorted(known_dialects)) + r")\b",
         re.I,
@@ -79,10 +131,15 @@ def main() -> None:
                     if mentioned_dialects:
                         for d in mentioned_dialects:
                             per_dialect_suite_tests[d].add(tnum)
-                    elif tfile == "tests/dialects/test_dialect.py":
-                        # Generic base-dialect test in test_dialect.py: include for all dialects
+                    elif tfile == "tests/dialects/test_dialect.py" and node.name == "test_dialect":
                         for d in known_dialects:
                             per_dialect_suite_tests[d].add(tnum)
+
+    # Propagate descendant dialect suites (e.g., hive -> spark -> databricks)
+    expanded_per_dialect_suite: dict[str, set[int]] = defaultdict(set)
+    for d, subs in descendants.items():
+        for sub_d in subs:
+            expanded_per_dialect_suite[d].update(per_dialect_suite_tests.get(sub_d, set()))
 
     opt_nums = {t["number"] for t in tests_by_file.get("tests/test_optimizer.py", [])}
 
@@ -117,14 +174,15 @@ def main() -> None:
         "fixtures": {k: sorted(v) for k, v in fixture_to_tests.items() if v},
         "dialect_aware_opt": sorted(dialect_aware_opt_tests),
         "per_dialect_opt": {k: sorted(v) for k, v in per_dialect_opt_tests.items() if v},
-        "per_dialect_suite": {k: sorted(v) for k, v in per_dialect_suite_tests.items() if v},
+        "per_dialect_suite": {k: sorted(v) for k, v in expanded_per_dialect_suite.items() if v},
+        "dialect_descendants": {k: sorted(v) for k, v in descendants.items()},
     }
     with gzip.open("fixture_map.json.gz", "wt", encoding="utf-8") as f:
         json.dump(payload, f, separators=(",", ":"))
     print(
         f"Mapped {len(payload['fixtures'])} fixtures, "
         f"{len(dialect_aware_opt_tests)} dialect-aware opt tests, "
-        f"{len(payload['per_dialect_suite'])} dialects in per_dialect_suite"
+        f"descendants sample: hive->{sorted(descendants.get('hive', []))}"
     )
 
 

@@ -5,12 +5,11 @@ from collections import defaultdict
 from pathlib import Path
 
 DATA = Path("/data")
+AST_PATH = Path("/app/ast_map.json.gz")
 FIXTURE_PATH = Path("/app/fixture_map.json.gz")
 SAMPLE_TESTS_PATH = Path("/app/sample_tests.json")
 MAX_WORKERS = 8
 WORKER_COST = 2.0
-
-HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 PARSER_STRESS_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 GENERATOR_STRESS_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
@@ -109,6 +108,14 @@ def is_doc_only(path: str) -> bool:
     )
 
 
+def module_name_for_path(fpath: str) -> str:
+    if fpath.endswith("/__init__.py"):
+        return fpath[:-12].replace("/", ".")
+    if fpath.endswith(".py"):
+        return fpath[:-3].replace("/", ".")
+    return fpath
+
+
 def main() -> None:
     tests_raw = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     by_num = {t["number"]: t for t in tests_raw}
@@ -140,12 +147,25 @@ def main() -> None:
     for t in tests_raw:
         tests_by_file[t["file"]].add(t["number"])
 
+    with gzip.open(AST_PATH, "rt", encoding="utf-8") as f:
+        ast_data = json.load(f)
+    imports_map: dict[str, list[str]] = ast_data["imports"]
+
+    direct_importers: dict[str, set[int]] = defaultdict(set)
+    for src_file, imported_mods in imports_map.items():
+        if src_file in tests_by_file:
+            tnums = tests_by_file[src_file]
+            for mod in imported_mods:
+                direct_importers[mod].update(tnums)
+
     with gzip.open(FIXTURE_PATH, "rt", encoding="utf-8") as f:
         fix_payload = json.load(f)
     fixture_map: dict[str, set[int]] = {k: remap_nums(v) for k, v in fix_payload["fixtures"].items()}
 
     opt_all = tests_by_file.get("tests/test_optimizer.py", set())
-    base_fast_all = all_nums - giant_nums
+    exec_all = tests_by_file.get("tests/test_executor.py", set())
+    non_exec_fast = all_nums - exec_all - giant_nums
+    all_non_giant = all_nums - giant_nums
 
     for patch_path in sorted((DATA / "commits").glob("*.patch")):
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
@@ -157,24 +177,26 @@ def main() -> None:
                 continue
             elif fpath in tests_by_file:
                 selected_nums.update(tests_by_file[fpath])
+                selected_nums.update(direct_importers.get(module_name_for_path(fpath), set()))
             elif fpath.startswith("tests/fixtures/optimizer/"):
                 selected_nums.update(opt_all)
                 if fpath in fixture_map:
                     selected_nums.update(fixture_map[fpath])
             elif fpath.startswith("tests/fixtures/"):
-                selected_nums.update(base_fast_all)
+                selected_nums.update(non_exec_fast)
             elif fpath.startswith("sqlglot/"):
-                selected_nums.update(base_fast_all)
                 is_leaf_dialect = (
                     fpath != "sqlglot/dialects/dialect.py"
                     and fpath.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
                 )
                 if is_leaf_dialect:
+                    selected_nums.update(non_exec_fast)
                     if fpath.startswith("sqlglot/parsers/"):
                         selected_nums.update(parser_stress_nums)
                     if fpath.startswith("sqlglot/generators/"):
                         selected_nums.update(gen_stress_nums)
                 else:
+                    selected_nums.update(all_non_giant)
                     selected_nums.update(tpcds_nums | tpch_nums)
                     if fpath in {"sqlglot/parser.py", "sqlglot/tokens.py"} or fpath.startswith("sqlglot/expressions"):
                         selected_nums.update(parser_stress_nums)

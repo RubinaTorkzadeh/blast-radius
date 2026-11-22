@@ -156,10 +156,10 @@ def lookup_function_level(
     spans = func_ranges.get(fpath, [])
     expanded_lines: set[int] = set()
     for ln in lines:
-        enclosing = [(s, e) for (s, e) in spans if (s - 15) <= ln <= (e + 15)]
+        enclosing = [(s, e) for (s, e) in spans if (s - 30) <= ln <= (e + 30)]
         for (s, e) in enclosing:
             expanded_lines.update(range(s, e + 1))
-        expanded_lines.update(range(max(1, ln - 15), ln + 16))
+        expanded_lines.update(range(max(1, ln - 30), ln + 31))
 
     matched: set[int] = set()
     for eln in expanded_lines:
@@ -254,14 +254,17 @@ def main() -> None:
                 selected_nums.update(all_dialect_suites)
                 selected_nums.update(core_unit_suites)
                 selected_nums.update(opt_all)
+                selected_nums.update(exec_fast)
             elif fpath.startswith("tests/fixtures/"):
                 selected_nums.update(all_dialect_suites)
                 selected_nums.update(core_unit_suites)
                 selected_nums.update(opt_all)
+                selected_nums.update(exec_fast)
             elif fpath.startswith("sqlglot/"):
                 stem = Path(fpath).stem
                 mod = module_name_for_path(fpath)
                 selected_nums.update(all_dialect_suites)
+                selected_nums.update(core_unit_suites)
                 selected_nums.update(direct_importers.get(mod, set()) - giant_nums)
                 if stem in dialect_map:
                     selected_nums.update(set(dialect_map[stem]) - giant_nums)
@@ -271,7 +274,6 @@ def main() -> None:
                     selected_nums.update(dialect_aware_opt - giant_nums)
                     selected_nums.update(tests_by_file.get("tests/test_transpile.py", set()) - giant_nums)
                 elif fpath.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
-                    selected_nums.update(core_unit_suites)
                     selected_nums.update(opt_all)
                     selected_nums.update(exec_all)
                 elif fpath in {
@@ -284,27 +286,23 @@ def main() -> None:
                     "sqlglot/tokens.py",
                     "sqlglot/typing.py",
                 }:
-                    selected_nums.update(core_unit_suites)
                     selected_nums.update(opt_all)
                     selected_nums.update(exec_all)
                     if fpath == "sqlglot/tokens.py":
                         selected_nums.update(parser_stress_nums)
                 elif fpath == "sqlglot/parser.py":
-                    selected_nums.update(core_unit_suites)
                     selected_nums.update(dialect_aware_opt - giant_nums)
                     selected_nums.update(parser_stress_nums)
                     func_hits = lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests)
                     selected_nums.update(func_hits - giant_nums)
                     selected_nums.update(func_hits & heavy_exec_nums)
                 elif fpath == "sqlglot/generator.py":
-                    selected_nums.update(core_unit_suites)
                     selected_nums.update(dialect_aware_opt - giant_nums)
                     selected_nums.update(gen_stress_nums)
                     func_hits = lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests)
                     selected_nums.update(func_hits - giant_nums)
                     selected_nums.update(func_hits & heavy_exec_nums)
                 else:
-                    selected_nums.update(core_unit_suites)
                     selected_nums.update(opt_all)
                     selected_nums.update(exec_all)
             else:

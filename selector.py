@@ -14,42 +14,16 @@ WORKER_COST = 2.0
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
-STRESS_TEST_IDS = {
-    "tests/test_parser.py::TestParser::test_max_nodes",
-    "tests/test_generator.py::TestGenerator::test_generator_memory",
+PARSER_STRESS_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+GENERATOR_STRESS_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
+HEAVY_EXECUTOR_IDS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
 }
-
-HEAVY_OPTIMIZER_ONLY_IDS = {
-    "tests/test_optimizer.py::TestOptimizer::test_scope",
-    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
-    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns",
-    "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
-    "tests/test_optimizer.py::TestOptimizer::test_tpcds",
-    "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
-    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries",
-    "tests/test_optimizer.py::TestOptimizer::test_canonicalize",
-    "tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain",
-}
-
-
-def normalize_code_lines(lines: list[str]) -> list[str]:
-    out: list[str] = []
-    for raw in lines:
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        if "#" in s and '"' not in s and "'" not in s:
-            s = s.split("#", 1)[0].rstrip()
-        if s:
-            out.append(s)
-    return out
 
 
 def parse_patch(patch_text: str) -> dict[str, set[int]]:
     file_lines: dict[str, set[int]] = defaultdict(set)
-    added_raw: dict[str, list[str]] = defaultdict(list)
-    removed_raw: dict[str, list[str]] = defaultdict(list)
-
     cur_file: str | None = None
     old_line = 0
     new_line = 0
@@ -82,23 +56,15 @@ def parse_patch(patch_text: str) -> dict[str, set[int]]:
         elif in_hunk and cur_file is not None:
             if line.startswith("+") and not line.startswith("+++"):
                 file_lines[cur_file].add(max(1, new_line))
-                added_raw[cur_file].append(line[1:])
                 new_line += 1
             elif line.startswith("-") and not line.startswith("---"):
                 file_lines[cur_file].add(max(1, old_line))
-                removed_raw[cur_file].append(line[1:])
                 old_line += 1
             else:
                 old_line += 1
                 new_line += 1
 
-    filtered: dict[str, set[int]] = {}
-    for fpath, lns in file_lines.items():
-        if fpath.endswith(".py"):
-            if normalize_code_lines(added_raw[fpath]) == normalize_code_lines(removed_raw[fpath]):
-                continue
-        filtered[fpath] = lns
-    return filtered
+    return dict(file_lines)
 
 
 def split_lpt(tests: list[dict], worker_count: int) -> tuple[float, list[list[int]]]:
@@ -109,7 +75,6 @@ def split_lpt(tests: list[dict], worker_count: int) -> tuple[float, list[list[in
         workers[lightest].append(test)
         loads[lightest] += test["seconds"]
 
-    # Local-search refinement: move or swap items off the heaviest worker
     if worker_count > 1:
         improved = True
         while improved:
@@ -122,7 +87,6 @@ def split_lpt(tests: list[dict], worker_count: int) -> tuple[float, list[list[in
                 other_load = loads[other_idx]
                 for i, t_a in enumerate(workers[heavy_idx]):
                     sec_a = t_a["seconds"]
-                    # Try single move
                     if max(heavy_load - sec_a, other_load + sec_a) < heavy_load - 1e-6:
                         workers[heavy_idx].pop(i)
                         workers[other_idx].append(t_a)
@@ -130,7 +94,6 @@ def split_lpt(tests: list[dict], worker_count: int) -> tuple[float, list[list[in
                         loads[other_idx] += sec_a
                         improved = True
                         break
-                    # Try 1-for-1 swap
                     for j, t_b in enumerate(workers[other_idx]):
                         sec_b = t_b["seconds"]
                         new_heavy = heavy_load - sec_a + sec_b
@@ -188,32 +151,15 @@ def lookup_function_level(
     cov_map: dict[str, dict[str, list[int]]],
     func_ranges: dict[str, list[list[int]]],
     file_all_tests: dict[str, set[int]],
-    direct_importers: dict[str, set[int]],
-    mod: str,
-    allow_module_fallback: bool = True,
 ) -> set[int]:
-    line_dict = cov_map[fpath]
+    line_dict = cov_map.get(fpath, {})
     spans = func_ranges.get(fpath, [])
     expanded_lines: set[int] = set()
-    module_level_touched = False
-
     for ln in lines:
-        enclosing = [(s, e) for (s, e) in spans if (s - 2) <= ln <= (e + 2)]
-        if enclosing:
-            min_len = min(e - s for (s, e) in enclosing)
-            for (s, e) in enclosing:
-                if (e - s) <= min_len + 5:
-                    expanded_lines.update(range(s, e + 1))
-        else:
-            module_level_touched = True
-
-    if module_level_touched and allow_module_fallback:
-        has_exec_module_line = any(
-            str(ln) in line_dict and not any((s - 2) <= ln <= (e + 2) for (s, e) in spans)
-            for ln in lines
-        )
-        if has_exec_module_line:
-            return file_all_tests.get(fpath, set()) | direct_importers.get(mod, set())
+        enclosing = [(s, e) for (s, e) in spans if (s - 15) <= ln <= (e + 15)]
+        for (s, e) in enclosing:
+            expanded_lines.update(range(s, e + 1))
+        expanded_lines.update(range(max(1, ln - 15), ln + 16))
 
     matched: set[int] = set()
     for eln in expanded_lines:
@@ -227,8 +173,11 @@ def main() -> None:
     tests_raw = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     by_num = {t["number"]: t for t in tests_raw}
     all_nums = set(by_num.keys())
-    stress_nums = {t["number"] for t in tests_raw if t["id"] in STRESS_TEST_IDS}
-    heavy_opt_only_nums = {t["number"] for t in tests_raw if t["id"] in HEAVY_OPTIMIZER_ONLY_IDS}
+
+    parser_stress_nums = {t["number"] for t in tests_raw if t["id"] == PARSER_STRESS_ID}
+    gen_stress_nums = {t["number"] for t in tests_raw if t["id"] == GENERATOR_STRESS_ID}
+    heavy_exec_nums = {t["number"] for t in tests_raw if t["id"] in HEAVY_EXECUTOR_IDS}
+    giant_nums = parser_stress_nums | gen_stress_nums | heavy_exec_nums
 
     tests_by_file: dict[str, set[int]] = defaultdict(set)
     for t in tests_raw:
@@ -255,9 +204,6 @@ def main() -> None:
         fix_payload = json.load(f)
     fixture_map: dict[str, list[int]] = fix_payload["fixtures"]
     dialect_aware_opt: set[int] = set(fix_payload["dialect_aware_opt"])
-    per_dialect_opt: dict[str, list[int]] = fix_payload.get("per_dialect_opt", {})
-    per_dialect_suite: dict[str, list[int]] = fix_payload.get("per_dialect_suite", {})
-    dialect_descendants: dict[str, list[str]] = fix_payload.get("dialect_descendants", {})
 
     mod_to_file: dict[str, str] = {}
     for src_file in imports_map:
@@ -281,23 +227,17 @@ def main() -> None:
             s.update(tlist)
         file_all_tests[fpath] = s
 
-    cross_dialect_suites: set[int] = set(dialect_aware_opt)
-    for tf in [
-        "tests/dialects/test_dialect.py",
-        "tests/test_transpile.py",
-    ]:
-        cross_dialect_suites.update(tests_by_file.get(tf, set()))
-    cross_dialect_suites -= (stress_nums | heavy_opt_only_nums)
+    all_dialect_suites: set[int] = set()
+    core_unit_suites: set[int] = set()
+    for tf, tnums in tests_by_file.items():
+        if tf.startswith("tests/dialects/"):
+            all_dialect_suites.update(tnums - giant_nums)
+        elif tf not in {"tests/test_optimizer.py", "tests/test_executor.py"}:
+            core_unit_suites.update(tnums - giant_nums)
 
-    optimizer_suites: set[int] = set()
-    for tf in [
-        "tests/test_optimizer.py",
-        "tests/test_executor.py",
-        "tests/test_transpile.py",
-        "tests/test_lineage.py",
-    ]:
-        optimizer_suites.update(tests_by_file.get(tf, set()))
-    optimizer_suites -= stress_nums
+    opt_all = tests_by_file.get("tests/test_optimizer.py", set())
+    exec_all = tests_by_file.get("tests/test_executor.py", set())
+    exec_fast = exec_all - heavy_exec_nums
 
     for patch_path in sorted((DATA / "commits").glob("*.patch")):
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
@@ -311,68 +251,62 @@ def main() -> None:
                 selected_nums.update(tests_by_file[fpath])
             elif fpath in fixture_map:
                 selected_nums.update(fixture_map[fpath])
-            elif fpath.startswith("tests/fixtures/optimizer/"):
-                selected_nums.update(tests_by_file.get("tests/test_optimizer.py", set()) - stress_nums)
+                selected_nums.update(all_dialect_suites)
+                selected_nums.update(core_unit_suites)
+                selected_nums.update(opt_all)
             elif fpath.startswith("tests/fixtures/"):
-                selected_nums.update(cross_dialect_suites)
-                stem_tokens = set(re.split(r"[^a-z0-9]+", fpath.lower())) - {"tests", "fixtures", "sql", "json", ""}
-                for tfile, tnums in tests_by_file.items():
-                    if any(tok in tfile.lower() for tok in stem_tokens if len(tok) >= 3):
-                        selected_nums.update(tnums - stress_nums)
-            elif fpath in cov_map:
-                f_tests = file_all_tests.get(fpath, set())
+                selected_nums.update(all_dialect_suites)
+                selected_nums.update(core_unit_suites)
+                selected_nums.update(opt_all)
+            elif fpath.startswith("sqlglot/"):
                 stem = Path(fpath).stem
                 mod = module_name_for_path(fpath)
-                is_dialect_family = (
-                    fpath.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
-                    and stem in dialect_map
-                )
-                if is_dialect_family:
-                    allowed_family = set(dialect_descendants.get(stem, [stem]))
-                    unrelated_dialect_tests: set[int] = set()
-                    for tf, tnums in tests_by_file.items():
-                        if tf.startswith("tests/dialects/test_") and tf != "tests/dialects/test_dialect.py":
-                            t_stem = Path(tf).stem[5:]
-                            if t_stem not in allowed_family:
-                                unrelated_dialect_tests.update(tnums)
+                selected_nums.update(all_dialect_suites)
+                selected_nums.update(direct_importers.get(mod, set()) - giant_nums)
+                if stem in dialect_map:
+                    selected_nums.update(set(dialect_map[stem]) - giant_nums)
 
-                    func_hits = lookup_function_level(
-                        fpath,
-                        lines,
-                        cov_map,
-                        func_ranges,
-                        file_all_tests,
-                        direct_importers,
-                        mod,
-                        allow_module_fallback=False,
-                    )
-                    selected_nums.update((func_hits - unrelated_dialect_tests) - stress_nums)
-                    if stem in per_dialect_suite:
-                        selected_nums.update((set(per_dialect_suite[stem]) - unrelated_dialect_tests) - stress_nums)
-                    else:
-                        selected_nums.update((set(dialect_map[stem]) - unrelated_dialect_tests) - stress_nums)
-                    for sub_d in allowed_family:
-                        selected_nums.update(
-                            set(per_dialect_opt.get(sub_d, dialect_aware_opt))
-                            - (stress_nums | heavy_opt_only_nums)
-                        )
-                    selected_nums.update((direct_importers.get(mod, set()) - unrelated_dialect_tests) - stress_nums)
-                elif fpath.startswith("sqlglot/optimizer/"):
-                    selected_nums.update(f_tests)
-                    selected_nums.update(optimizer_suites)
-                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
-                elif fpath.startswith("sqlglot/executor/"):
-                    selected_nums.update(
-                        lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod)
-                    )
-                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
-                elif len(f_tests) <= 350:
-                    selected_nums.update(f_tests)
-                    selected_nums.update(direct_importers.get(mod, set()) - stress_nums)
+                if fpath.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+                    selected_nums -= exec_all
+                    selected_nums.update(dialect_aware_opt - giant_nums)
+                    selected_nums.update(tests_by_file.get("tests/test_transpile.py", set()) - giant_nums)
+                elif fpath.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
+                    selected_nums.update(core_unit_suites)
+                    selected_nums.update(opt_all)
+                    selected_nums.update(exec_all)
+                elif fpath in {
+                    "sqlglot/expressions.py",
+                    "sqlglot/schema.py",
+                    "sqlglot/planner.py",
+                    "sqlglot/errors.py",
+                    "sqlglot/__init__.py",
+                    "sqlglot/helper.py",
+                    "sqlglot/tokens.py",
+                    "sqlglot/typing.py",
+                }:
+                    selected_nums.update(core_unit_suites)
+                    selected_nums.update(opt_all)
+                    selected_nums.update(exec_all)
+                    if fpath == "sqlglot/tokens.py":
+                        selected_nums.update(parser_stress_nums)
+                elif fpath == "sqlglot/parser.py":
+                    selected_nums.update(core_unit_suites)
+                    selected_nums.update(dialect_aware_opt - giant_nums)
+                    selected_nums.update(parser_stress_nums)
+                    func_hits = lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests)
+                    selected_nums.update(func_hits - giant_nums)
+                    selected_nums.update(func_hits & heavy_exec_nums)
+                elif fpath == "sqlglot/generator.py":
+                    selected_nums.update(core_unit_suites)
+                    selected_nums.update(dialect_aware_opt - giant_nums)
+                    selected_nums.update(gen_stress_nums)
+                    func_hits = lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests)
+                    selected_nums.update(func_hits - giant_nums)
+                    selected_nums.update(func_hits & heavy_exec_nums)
                 else:
-                    selected_nums.update(
-                        lookup_function_level(fpath, lines, cov_map, func_ranges, file_all_tests, direct_importers, mod)
-                    )
+                    selected_nums.update(core_unit_suites)
+                    selected_nums.update(opt_all)
+                    selected_nums.update(exec_all)
             else:
                 selected_nums.update(all_nums)
 

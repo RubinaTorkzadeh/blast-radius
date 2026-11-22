@@ -5,11 +5,15 @@ from collections import defaultdict
 from pathlib import Path
 
 DATA = Path("/data")
+COV_PATH = Path("/app/coverage_map.json.gz")
 AST_PATH = Path("/app/ast_map.json.gz")
+DIALECT_PATH = Path("/app/dialect_map.json.gz")
 FIXTURE_PATH = Path("/app/fixture_map.json.gz")
 SAMPLE_TESTS_PATH = Path("/app/sample_tests.json")
 MAX_WORKERS = 8
 WORKER_COST = 2.0
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 PARSER_STRESS_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 GENERATOR_STRESS_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
@@ -20,22 +24,52 @@ TPCH_EXEC_IDS = {
 }
 
 
-def parse_patch_files(patch_text: str) -> set[str]:
-    files: set[str] = set()
+def parse_patch_lines(patch_text: str) -> dict[str, set[int]]:
+    file_lines: dict[str, set[int]] = defaultdict(set)
+    cur_file: str | None = None
+    old_line = 0
+    new_line = 0
+    in_hunk = False
+
     for line in patch_text.splitlines():
         if line.startswith("diff --git "):
+            in_hunk = False
             parts = line.split()
             if len(parts) >= 4 and parts[3].startswith("b/"):
-                files.add(parts[3][2:])
+                cur_file = parts[3][2:]
+                file_lines.setdefault(cur_file, set())
+            else:
+                cur_file = None
         elif line.startswith("+++ "):
             target = line[4:].strip()
             if target != "/dev/null":
-                files.add(target[2:] if target.startswith("b/") else target)
+                cur_file = target[2:] if target.startswith("b/") else target
+                file_lines.setdefault(cur_file, set())
         elif line.startswith("--- "):
             target = line[4:].strip()
-            if target != "/dev/null":
-                files.add(target[2:] if target.startswith("a/") else target)
-    return files
+            if cur_file is None and target != "/dev/null":
+                cur_file = target[2:] if target.startswith("a/") else target
+                file_lines.setdefault(cur_file, set())
+        elif line.startswith("@@ ") and cur_file is not None:
+            m = HUNK_RE.match(line)
+            if m:
+                old_line = int(m.group(1))
+                new_line = int(m.group(3))
+                in_hunk = True
+                file_lines[cur_file].add(max(1, old_line))
+                file_lines[cur_file].add(max(1, new_line))
+        elif in_hunk and cur_file is not None:
+            if line.startswith("+") and not line.startswith("+++"):
+                file_lines[cur_file].add(max(1, new_line))
+                new_line += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                file_lines[cur_file].add(max(1, old_line))
+                old_line += 1
+            else:
+                old_line += 1
+                new_line += 1
+
+    return dict(file_lines)
 
 
 def split_lpt(tests: list[dict], worker_count: int) -> tuple[float, list[list[int]]]:
@@ -147,8 +181,22 @@ def main() -> None:
     for t in tests_raw:
         tests_by_file[t["file"]].add(t["number"])
 
+    with gzip.open(COV_PATH, "rt", encoding="utf-8") as f:
+        raw_cov: dict[str, dict[str, list[int]]] = json.load(f)
+
+    cov_map: dict[str, dict[str, set[int]]] = {}
+    file_all_cov: dict[str, set[int]] = defaultdict(set)
+    for k, v in raw_cov.items():
+        remapped_lines = {ln: remap_nums(tlist) for ln, tlist in v.items()}
+        cov_map[k] = remapped_lines
+        norm = k[len("sqlglot/"):] if k.startswith("sqlglot/sqlglot/") else k
+        cov_map[norm] = remapped_lines
+        for tset in remapped_lines.values():
+            file_all_cov[norm].update(tset)
+
     with gzip.open(AST_PATH, "rt", encoding="utf-8") as f:
         ast_data = json.load(f)
+    func_ranges: dict[str, list[list[int]]] = ast_data["func_ranges"]
     imports_map: dict[str, list[str]] = ast_data["imports"]
 
     direct_importers: dict[str, set[int]] = defaultdict(set)
@@ -158,50 +206,66 @@ def main() -> None:
             for mod in imported_mods:
                 direct_importers[mod].update(tnums)
 
+    with gzip.open(DIALECT_PATH, "rt", encoding="utf-8") as f:
+        raw_dialect_map: dict[str, list[int]] = json.load(f)
+    dialect_map: dict[str, set[int]] = {k: remap_nums(v) for k, v in raw_dialect_map.items()}
+
     with gzip.open(FIXTURE_PATH, "rt", encoding="utf-8") as f:
         fix_payload = json.load(f)
     fixture_map: dict[str, set[int]] = {k: remap_nums(v) for k, v in fix_payload["fixtures"].items()}
 
     opt_all = tests_by_file.get("tests/test_optimizer.py", set())
     exec_all = tests_by_file.get("tests/test_executor.py", set())
-    non_exec_fast = all_nums - exec_all - giant_nums
-    all_non_giant = all_nums - giant_nums
 
     for patch_path in sorted((DATA / "commits").glob("*.patch")):
         patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
-        changed_files = parse_patch_files(patch_text)
+        file_lines = parse_patch_lines(patch_text)
 
         selected_nums: set[int] = set()
-        for fpath in changed_files:
+        for fpath, lines in file_lines.items():
             if is_doc_only(fpath):
                 continue
             elif fpath in tests_by_file:
                 selected_nums.update(tests_by_file[fpath])
                 selected_nums.update(direct_importers.get(module_name_for_path(fpath), set()))
-            elif fpath.startswith("tests/fixtures/optimizer/"):
-                selected_nums.update(opt_all)
-                if fpath in fixture_map:
-                    selected_nums.update(fixture_map[fpath])
-            elif fpath.startswith("tests/fixtures/"):
-                selected_nums.update(non_exec_fast)
+            elif fpath in fixture_map and fixture_map[fpath]:
+                selected_nums.update(fixture_map[fpath])
+                if fpath.startswith("tests/fixtures/optimizer/"):
+                    selected_nums.update(opt_all)
             elif fpath.startswith("sqlglot/"):
-                is_leaf_dialect = (
-                    fpath != "sqlglot/dialects/dialect.py"
-                    and fpath.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
-                )
-                if is_leaf_dialect:
-                    selected_nums.update(non_exec_fast)
-                    if fpath.startswith("sqlglot/parsers/"):
-                        selected_nums.update(parser_stress_nums)
-                    if fpath.startswith("sqlglot/generators/"):
-                        selected_nums.update(gen_stress_nums)
+                selected_nums.update(opt_all)
+                lmap = cov_map.get(f"sqlglot/{fpath}", cov_map.get(fpath, {}))
+                ranges = func_ranges.get(fpath, [])
+                if lmap:
+                    for ln in lines:
+                        matched_fn = False
+                        for st, en in ranges:
+                            if st <= ln <= en:
+                                matched_fn = True
+                                for fln in range(st, en + 1):
+                                    selected_nums.update(lmap.get(str(fln), set()) - giant_nums)
+                        if not matched_fn:
+                            selected_nums.update(file_all_cov.get(fpath, set()) - giant_nums)
+                            stem = Path(fpath).stem
+                            if stem in dialect_map:
+                                selected_nums.update(dialect_map[stem] - giant_nums)
                 else:
-                    selected_nums.update(all_non_giant)
-                    selected_nums.update(tpcds_nums | tpch_nums)
-                    if fpath in {"sqlglot/parser.py", "sqlglot/tokens.py"} or fpath.startswith("sqlglot/expressions"):
-                        selected_nums.update(parser_stress_nums)
-                    if fpath == "sqlglot/generator.py" or fpath.startswith("sqlglot/expressions"):
-                        selected_nums.update(gen_stress_nums)
+                    selected_nums.update(all_nums - giant_nums)
+
+                if (
+                    fpath.startswith(("sqlglot/optimizer/", "sqlglot/executor/", "sqlglot/expressions"))
+                    or fpath in {
+                        "sqlglot/planner.py",
+                        "sqlglot/schema.py",
+                        "sqlglot/serde.py",
+                        "sqlglot/dialects/dialect.py",
+                    }
+                ):
+                    selected_nums.update(exec_all)
+                if fpath in {"sqlglot/parser.py", "sqlglot/tokens.py"} or fpath.startswith("sqlglot/expressions"):
+                    selected_nums.update(parser_stress_nums)
+                if fpath == "sqlglot/generator.py" or fpath.startswith("sqlglot/expressions"):
+                    selected_nums.update(gen_stress_nums)
             else:
                 selected_nums.update(all_nums)
 
